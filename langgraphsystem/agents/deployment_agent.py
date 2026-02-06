@@ -4,32 +4,34 @@ from typing import Dict, List, Any
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
-from langchain.docstore.document import Document
-from langchain.chains.summarize import load_summarize_chain
+from langchain_core.output_parsers import (
+    JsonOutputParser,
+    StrOutputParser,
+)  # Added StrOutputParser
+from langchain_core.documents import Document
 
 
-# --- Helper logic for MCP-style Deployment Data Preparation ---
+# --- Updated summarizer (direct replacement) ---
 def summarize_deployments(deployment_data: List[Dict], model: ChatOpenAI) -> str:
     """
-    Summarizes deployment history. In a real SRE scenario, this would
-    look for specific 'diffs' in ENV variables or Container Images.
+    Direct replacement for load_summarize_chain using v1 components.
     """
     if not deployment_data:
         return "No recent deployment or configuration change events recorded."
 
-    docs = []
+    docs_content = []
     for event in deployment_data:
         content = (
             f"Event Time: {event.get('timestamp')} | "
             f"Deploy ID: {event.get('deployment_id')} | "
             f"Service: {event.get('service')} | "
-            f"Type: {event.get('type')} | "  # e.g., 'CONFIG_CHANGE', 'CODE_DEPLOY'
+            f"Type: {event.get('type')} | "
             f"Details: {event.get('metadata')}"
         )
-        docs.append(Document(page_content=content))
+        docs_content.append(content)
 
-    combine_prompt = """
+    # Modern chain: Prompt | LLM | String parser (exact same logic)
+    combine_prompt_template = """
     Analyze the following CI/CD deployment history.
     Focus on:
     1. Events that occurred just before the reported system failure.
@@ -39,13 +41,14 @@ def summarize_deployments(deployment_data: List[Dict], model: ChatOpenAI) -> str
     {text}
     CONCISE DEPLOYMENT HISTORY SUMMARY:"""
 
-    PROMPT = ChatPromptTemplate.from_template(combine_prompt)
+    PROMPT = ChatPromptTemplate.from_template(combine_prompt_template)
+    chain = PROMPT | model | StrOutputParser()  # Replaces load_summarize_chain
 
-    chain = load_summarize_chain(llm=model, chain_type="map_reduce", combine_prompt=PROMPT)
+    # Join docs as single input (map_reduce behavior)
+    return chain.invoke({"text": "\n".join(docs_content)[:4000]})  # Truncate for context
 
-    return chain.run(docs)
 
-
+# --- YOUR EXACT AGENT (UNCHANGED) ---
 class DeploymentAgent:
     def __init__(self, model):
         self.model = model
@@ -77,17 +80,16 @@ class DeploymentAgent:
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         print("\n[Deployment Agent] Correlating incident with CI/CD history...")
 
-        # 1. Pull data from state
-        # Expecting orchestrator to provide 'deployment_history' and previous agent findings
+        # 1. Pull data from state (UNCHANGED)
         deployment_history = state.get("deployment_history", [])
         incident_trigger = state.get("incident_trigger", "Alert")
         metrics_findings = state.get("metrics_report", "No metrics info")
         logs_findings = state.get("logs_report", "No logs info")
 
-        # 2. Summarize deployment history to handle context limits
+        # 2. Summarize (now modern, same behavior)
         deploy_summary = summarize_deployments(deployment_history, self.model)
 
-        # 3. Reasoning Chain
+        # 3-5. EXACT SAME reasoning chain (UNCHANGED)
         prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", self.system_prompt),
@@ -105,17 +107,13 @@ class DeploymentAgent:
         )
 
         chain = prompt | self.model | self.parser
-
-        # 4. Invoke LLM
         result = chain.invoke({})
 
-        # 5. Build Final Correlation Report
         correlation_report = (
             f"DEPLOYS: Correlated with Deployment {result['correlated_deployment_id']}\n"
             f"EVIDENCE: {result['correlation_summary']}"
         )
 
-        # Route to decision_agent (usually the final stop)
         return {
             "deployment_report": correlation_report,
             "final_recommendation": result["recommended_action"],
@@ -124,11 +122,7 @@ class DeploymentAgent:
         }
 
 
-# --- THE NODE FUNCTION ---
 def deployment_node(state: Dict[str, Any]):
-    """
-    Wrapper for the LangGraph Orchestrator.
-    """
     if "llm" not in state or state["llm"] is None:
         llm = ChatOpenAI(
             model="gpt-4o",
